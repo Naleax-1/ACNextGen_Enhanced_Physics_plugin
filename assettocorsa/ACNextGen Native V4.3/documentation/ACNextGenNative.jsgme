@@ -1,0 +1,6 @@
+ACNextGen Native V4.3 — 51 compiled C++ enhancement models.
+Observer, native DLL and host EXE are installed together.
+Offline common Worker; bounded additional yaw damping.
+Experimental body lateral damping on the calibrated car/CSP.
+Suspension reaction and rear-LSD capture pending calibration.
+No car data scripts or vehicle assets are installed.
