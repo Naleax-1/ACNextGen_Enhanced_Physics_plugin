@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "evidence_id": "body-force-N-20261014",
+  "date": "2026-10-14",
+  "car_id": "wdts_nissan_silvia_s14",
+  "patch_code": 3465,
+  "body_force_supported": true,
+  "world_body_response_verified": true,
+  "wheel_reaction_verified": false,
+  "LSD_verified": false,
+  "global_calibration_verified": false,
+  "force_argument_unit": "N at physics rate; do not multiply the already-N command by dt",
+  "world_direct": {
+    "pairs": 12,
+    "mean_paired_difference": 0.0001990138610716813,
+    "difference_sd": 8.634827829391189e-05,
+    "exact_two_sided_sign_flip_p": 0.00048828125,
+    "positive_response_detected": true,
+    "calibration_verified": false,
+    "limitation": "Randomized paired contrast under contact constraints. Response detection is not an SI gain, inertia, reaction or full actuator validation."
+  },
+  "local_direct": {
+    "pairs": 12,
+    "mean_paired_difference": 0.0002758954922139887,
+    "difference_sd": 0.00018340840935883134,
+    "exact_two_sided_sign_flip_p": 0.00048828125,
+    "positive_response_detected": true,
+    "calibration_verified": false,
+    "limitation": "Randomized paired contrast under contact constraints. Response detection is not an SI gain, inertia, reaction or full actuator validation."
+  },
+  "dt_scaled": {
+    "pairs": 12,
+    "mean_paired_difference": 3.118493504519795e-05,
+    "difference_sd": 0.00015444029992190368,
+    "exact_two_sided_sign_flip_p": 0.4892578125,
+    "positive_response_detected": false,
+    "calibration_verified": false,
+    "limitation": "Randomized paired contrast under contact constraints. Response detection is not an SI gain, inertia, reaction or full actuator validation."
+  },
+  "SDK_mass_kg": 1320.0,
+  "SDK_mass_effective_body_verified": false,
+  "independent_free_body_reference_delta_ms": 0.00020454545454545457,
+  "scope": "Body-force unit and world-coordinate response on this car/CSP. Tyre-route whole-vehicle validation still required; wheel reaction and torque excluded.",
+  "worker_sha256": "72575edcc84a6bc09f70a13b77af0a9d9f598d800d686f13babbb869409f5f27",
+  "SDK_sha256": "cdd729ff7b71313491d700f1b16382204cd1c0832019b58e486032019549d131"
+}
