@@ -12,7 +12,16 @@ local function releaseCalibrationBrake()
 end
 local function store(key,value) ac.store('ngp4_'..key,value) end
 local function load(key) return ac.load('ngp4_'..key) end
+local function closeDatum(reason,keep)
+    local id=s.datumJob;local hadChannel=s.datumChannel~=nil
+    if s.datumChannel then s.datumChannel:close();s.datumChannel=nil end
+    if id and load('fixture_job')==id then store('fixture_job','') end
+    if id and hadChannel and not keep then pcall(ac.log,'[ACNextGen DATUM '..id..'] RECEIVE_FAILED reason='..tostring(reason)) end
+    s.datumJob=nil;s.datumContext=nil;s.datumWorkerEnded=nil;s.datumMonitor=nil;s.datumMonitorStart=nil;s.datumMonitorSamples=nil;s.datumMonitorFirst=nil
+    if not keep then s.datumObservation=nil end
+end
 local function bump()
+    closeDatum('context_changed')
     releaseCalibrationBrake()
     s.generation=s.generation+1
     if s.generation>=2147483647 then s.generation=1 end
@@ -44,7 +53,7 @@ end
 local function calibration()
     -- No request file ships with the package. Only a short-lived, explicitly
     -- issued one-shot request can launch the separate probe Worker.
-    if not s.physical or not s.active or not s.enabled or not s.permission or s.age>.2 then return end
+    if s.airborneCaptureOnly or not s.physical or not s.active or not s.enabled or not s.permission or s.age>.2 then return end
     local raw=read(s.root..'/runtime/calibration_request.json')
     if not raw or #raw>1024 then return end
     local ok,r=pcall(function() return JSON.parse(raw) end)
@@ -55,7 +64,10 @@ local function calibration()
     local wheel=s.calibrationCaptureOnly and r.kind=='wheel_vertical' and (r.argument==.1 or r.argument==1 or r.argument==10) and
         type(r.wheel_index)=='number' and r.wheel_index>=0 and r.wheel_index<=3 and r.wheel_index%1==0 and r.frames==8 and
         (r.argument_mode=='wheel_only' or r.argument_mode=='paired' or r.argument_mode=='control') and r.point_frame=='world'
-    if r.schema~=1 or not (body or rear or wheel) or
+    local datum=s.calibrationCaptureOnly and r.kind=='wheel_datum' and r.authorization=='datum_only_v1' and r.torque_argument==0 and r.auto_handbrake~=true
+    if r.schema~=1 or not (body or rear or wheel or datum) or
+        (r.monitor_seconds~=nil and (not datum or r.observation_channel~='datum_v1' or r.monitor_seconds~=.3)) or
+        (r.observation_channel~=nil and (not datum or r.observation_channel~='datum_v1' or type(r.channel_nonce)~='string' or #r.channel_nonce~=32 or not r.channel_nonce:match('^[a-f0-9]+$'))) or
         (r.rear_phase_aligned~=nil and (not rear or type(r.rear_phase_aligned)~='boolean')) or
         (r.settle_frames~=nil and r.settle_frames~=0 and r.settle_frames~=200) or
         (r.point_frame~=nil and r.point_frame~='local' and r.point_frame~='world') or
@@ -66,6 +78,32 @@ local function calibration()
     -- Consume before launch so a callback, Resume or App reload cannot replay it.
     store('calibration_consumed',r.id)
     local source=read(s.root..'/calibration_worker.lua')
+    if datum then
+        local geometry=read(s.root..'/experiments/freewheel_geometry.lua')
+        local observer=read(s.root..'/experiments/freewheel_worker_observer.lua')
+        local entry=read(s.root..'/experiments/freewheel_datum_worker.lua')
+        if not geometry or not observer or not entry then ac.log('[ACNextGen] Datum source missing');return end
+        source='local FreewheelGeometry=(function()\n'..geometry..'\nend)()\nlocal FreewheelObserver=(function()\n'..observer..'\nend)()\n'..entry
+        if r.observation_channel=='datum_v1' then
+            local base=read(s.root..'/experiments/freewheel_transport.lua')
+            local codec=read(s.root..'/experiments/freewheel_datum_transport.lua')
+            local channel=read(s.root..'/experiments/freewheel_channel.lua')
+            if not base or not codec or not channel then ac.log('[ACNextGen] Datum channel source missing');return end
+            local ok,receiver=pcall(function()
+                local transport=assert(loadfile(s.root..'/experiments/freewheel_transport.lua'))()
+                local format=assert(loadfile(s.root..'/experiments/freewheel_datum_transport.lua'))().new(transport)
+                local protocol=assert(loadfile(s.root..'/experiments/freewheel_channel.lua'))()
+                s.datumElapsed=0;s.datumAdvances=0;s.datumSequence=nil;s.datumObservation=nil
+                return protocol.app(format,{id=r.id,car_id=r.car_id,epoch=r.epoch,generation=r.generation},r.channel_nonce,
+                    function()return s.datumElapsed end,{load=ac.load,store=ac.store})
+            end)
+            if not ok then ac.log('[ACNextGen] Datum channel rejected: '..tostring(receiver));return end
+            s.datumChannel=receiver;s.datumMonitor=r.monitor_seconds;s.datumMonitorSamples=0;s.datumMonitorStart=nil;s.datumMonitorFirst=nil
+            s.datumContext={host_id=r.host_id,car_id=r.car_id,epoch=r.epoch,generation=r.generation}
+            source='local FreewheelTransport=(function()\n'..base..'\nend)()\nlocal FreewheelDatumTransport=(function()\n'..codec..'\nend)()\nlocal FreewheelChannel=(function()\n'..channel..'\nend)()\n'..source
+        end
+        store('fixture_job',r.id);s.datumJob=r.id
+    end
     if not source then ac.log('[ACNextGen] Calibration source missing');return end
     if r.auto_handbrake==true then
         local car=ac.getCar(0)
@@ -82,10 +120,15 @@ local function calibration()
     r.epoch=s.epoch;r.generation=s.generation
     local launched,message=pcall(physics.startPhysicsWorker,source,r,function(error)
         local complete=load('calibration_result_id')==r.id and load('calibration_completed')==1
+        if datum and s.datumJob==r.id then
+            if s.datumChannel and not error and complete then s.datumWorkerEnded=true
+            else closeDatum('worker_exit') end
+        end
         if s.brakeOwner==r.id and (error or not complete or r.keep_brake_after_probe~=true) then releaseCalibrationBrake() end
         ac.log('[ACNextGen CAL '..r.id..'] WORKER_EXIT '..tostring(error or 'normal'))
     end)
     if not launched then
+        if datum and s.datumJob==r.id then closeDatum('launch_failed') end
         if s.brakeOwner==r.id then releaseCalibrationBrake() end
         ac.log('[ACNextGen CAL '..r.id..'] LAUNCH_FAILED '..tostring(message))
     end
@@ -95,7 +138,9 @@ function M.init(root,physical,enhancement)
     s.requested=false;s.retry=0;s.lastClock=nil;s.age=math.huge
     s.enhancementCapture=type(enhancement)=='table' and enhancement.capture==true
     s.wheelIntervalCapture=s.enhancementCapture and enhancement.wheel_interval_capture==true
+    s.wheelReferenceCapture=s.enhancementCapture and enhancement.wheel_reference_capture==true
     s.calibrationCaptureOnly=type(enhancement)=='table' and enhancement.calibration_capture_only==true
+    s.airborneCaptureOnly=type(enhancement)=='table' and enhancement.airborne_capture_only==true
     s.enhancementApply=s.physical and s.enhancementCapture and enhancement.apply==true and enhancement.calibration=='verified'
     s.tyreProfile=nil;s.enhancementApplyMask=0
     local profile=type(enhancement)=='table' and enhancement.tyre_lateral_profile or nil
@@ -273,7 +318,8 @@ local function launch()
     local ok,message=pcall(physics.startPhysicsWorker,source,
         {epoch=s.epoch,car_id=s.carID,physical_enabled=s.physical and not s.calibrationCaptureOnly,
             enhancement_capture=s.enhancementCapture,enhancement_apply=s.enhancementApply or s.enhancementApplyMask>0,
-            enhancement_apply_mask=s.enhancementApplyMask,body_profile=bodyProfile(),damper_profile=damper,spring_profile=spring,drive_profile=drive,wheel_torque_profile=wheel,wheel_interval_capture=intervalCapture},function(error)
+            enhancement_apply_mask=s.enhancementApplyMask,body_profile=bodyProfile(),damper_profile=damper,spring_profile=spring,drive_profile=drive,wheel_torque_profile=wheel,wheel_interval_capture=intervalCapture,
+            wheel_reference_capture=s.wheelReferenceCapture},function(error)
             if s.epoch~=launchEpoch then return end
             s.requested=false;s.retry=1;s.status=error and 'Worker stopped with error' or 'Worker stopped'
             if error then s.error=tostring(error) end
@@ -297,6 +343,51 @@ function M.update(dt,active,enabled,carID)
     s.enhancementApplyMask=s.calibrationCaptureOnly and 0 or (s.enhancementApply and 7 or (s.tyreProfile and s.tyreProfile.car_id==carID and 2 or 0))
     M.setEnabled(s.active and enabled==true)
     if not s.active then s.status='Waiting for offline session';return end
+    if s.datumJob then
+        local ok,r=pcall(function()return JSON.parse(read(s.root..'/runtime/calibration_request.json') or '')end)
+        if not ok or type(r)~='table' or r.id~=s.datumJob then closeDatum('request_cancelled') end
+    end
+    if s.datumChannel then
+        local c=s.datumContext
+        if not s.enabled or not s.permission or not s.calibrationCaptureOnly or s.enhancementApplyMask~=0 or not c
+            or c.host_id~=s.hostID or c.car_id~=s.carID or c.epoch~=s.epoch or c.generation~=s.generation then closeDatum('context_changed')
+        else
+            s.datumElapsed=s.datumElapsed+dt
+            local observation,reason=s.datumChannel:poll()
+            if observation then
+                if s.datumSequence then s.datumAdvances=s.datumAdvances+1 end;s.datumSequence=observation.sequence
+                if observation.datum_ready then
+                    if s.datumAdvances<2 then closeDatum('insufficient_native_progress')
+                    else
+                        local monitor=s.datumMonitor~=nil
+                        local schema_ok=monitor and observation.monitor_complete~=nil or not monitor and observation.monitor_complete==nil
+                        if not schema_ok then closeDatum('monitor_schema_mismatch')
+                        elseif monitor and s.datumMonitorStart and s.datumMonitorStart~=observation.monitor_started_clock then closeDatum('monitor_start_changed')
+                        else
+                            observation.host_id=c.host_id;observation.received_at=s.datumElapsed;observation.actuation_allowed=false;observation.airborne_verified=false
+                            if monitor then
+                                if not s.datumMonitorStart then
+                                    s.datumMonitorStart=observation.monitor_started_clock;s.datumMonitorFirst=observation.sequence
+                                    pcall(ac.log,'[ACNextGen DATUM '..s.datumJob..'] MONITOR_STARTED sequence='..observation.sequence)
+                                end
+                                s.datumMonitorSamples=s.datumMonitorSamples+1
+                                observation.monitor_samples=s.datumMonitorSamples;observation.monitor_first_sequence=s.datumMonitorFirst
+                            end
+                            s.datumObservation=observation
+                            if not monitor or observation.monitor_complete then
+                                if monitor and s.datumMonitorSamples<3 then closeDatum('monitor_progress_insufficient')
+                                else
+                                    local tag=monitor and 'MONITOR_COMPLETE' or 'RECEIVED'
+                                    pcall(function()ac.log('[ACNextGen DATUM '..s.datumJob..'] '..tag..' sequence='..observation.sequence..' planes=4 advances='..s.datumAdvances..' data='..JSON.stringify(observation))end)
+                                    closeDatum('received',true)
+                                end
+                            end
+                        end
+                    end
+                end
+            elseif reason~='waiting' and reason~='unmatched_challenge' and reason~='replayed' then closeDatum(reason) end
+        end
+    end
     s.calibrationTimer=(s.calibrationTimer or 0)+dt
     if s.calibrationTimer>=1 then s.calibrationTimer=0;calibration() end
     if s.timer>=.05 then

@@ -29,6 +29,7 @@ local function metricSnapshot()
         native_status=s.status,enhancement=s.enhancement,owned_actuation=(s.data or {}).owned_actuation,
         tyre_inputs=(s.data or {}).tyre_inputs,worker_epoch=b.sensor_epoch,worker_generation=b.generation,
         input_audit=Metrics.inputAudit(carOK and car or nil,sim),
+        native_reference=Metrics.nativeReference(),
         input_routes=(s.data or {}).input_routes,
         damper_local_channel=(s.data or {}).damper_local_channel,
         spring_local_channel=(s.data or {}).spring_local_channel,
@@ -87,6 +88,9 @@ local function beginSession()
     state.sequence=state.sequence+1;state.launchTimer=0;Bridge.newSession();send();prepare()
 end
 function M.shutdown()
+    if state.airborneJig then state.airborneJig:shutdown();state.airborneJig=nil end
+    if state.restoreOnly then state.restoreOnly:shutdown();state.restoreOnly=nil end
+    if state.snapshotSave then state.snapshotSave:shutdown();state.snapshotSave=nil end
     state.enabled=false;state.sessionActive=false;state.shuttingDown=true
     state.sequence=state.sequence+1;Bridge.shutdown();local result=send();prepare();return result
 end
@@ -106,8 +110,76 @@ function M.init()
         elseif cfg.model_input_contract=='csp_g_v1' then state.inputContract='csp_g_v1'
         else state.physicalEnabled=false;state.configError='Observe mode: invalid model_input_contract' end
     else state.configError='Observe mode: missing or invalid config.json' end
-    Bridge.init(ROOT,state.physicalEnabled,ok and type(cfg)=='table' and cfg.enhancement or nil)
+    local enhancement=ok and type(cfg)=='table' and cfg.enhancement or nil
+    if ok and type(cfg)=='table' and cfg.airborne_zero_capture==true then
+        local copy={};if type(enhancement)=='table'then for k,v in pairs(enhancement)do copy[k]=v end end
+        copy.airborne_capture_only=true;enhancement=copy
+    end
+    Bridge.init(ROOT,state.physicalEnabled,enhancement)
     state.wheelMaterialCapture=ok and type(cfg)=='table' and type(cfg.enhancement)=='table' and cfg.enhancement.wheel_interval_capture==true
+    -- Explicit experiment opt-in, separate from normal physics operation.
+    if ok and type(cfg)=='table' and cfg.snapshot_save_only_capture==true then
+        local loaded,runner=pcall(function()
+            assert(cfg.airborne_zero_capture~=true,'Snapshot and airborne capture are exclusive')
+            assert(Bridge.getState().calibrationCaptureOnly==true,'Snapshot capture requires calibration-only configuration')
+            local function experiment(name)
+                return assert(loadfile(ROOT..'/experiments/'..name..'.lua'))()
+            end
+            local preview
+            if cfg.snapshot_transform_preview_only==true then
+                local transformer=experiment('translated_snapshot_preview')
+                local helpers=require('shared/sim/cars')
+                preview=function(bytes,job)
+                    local candidate,detail=transformer.preview(bytes,helpers)
+                    ac.log('[ACNextGen SnapshotPreview '..job.id..'] '..JSON.stringify({
+                        success=candidate~=nil,diagnostic=detail,original_size=#bytes,
+                        candidate_size=candidate and #candidate,actuation_allowed=false}))
+                    -- Candidate bytes are discarded, never loaded or archived.
+                end
+            end
+            return experiment('freewheel_observer_binding').new(ROOT,
+                experiment('freewheel_save_supervisor'),experiment('freewheel_snapshot_capture'),preview)
+        end)
+        if loaded then state.snapshotSave=runner;ac.log('[ACNextGen Snapshot] save-only supervisor initialized')
+        else state.snapshotSaveError=tostring(runner);ac.log('[ACNextGen Snapshot] initialization rejected: '..state.snapshotSaveError) end
+    end
+    if ok and type(cfg)=='table' and cfg.restore_only_capture==true then
+        local loaded,runner=pcall(function()
+            assert(cfg.airborne_zero_capture~=true,'Restore and airborne capture are exclusive')
+            assert(Bridge.getState().calibrationCaptureOnly==true,'Restore-only requires calibration-only configuration')
+            assert(cfg.snapshot_save_only_capture~=true,'Save-only and restore-only must not run together')
+            local function experiment(name)return assert(loadfile(ROOT..'/experiments/'..name..'.lua'))()end
+            local parts={session=experiment('restore_session'),driver=experiment('restore_driver'),
+                fixture=experiment('freewheel_fixture'),capture=experiment('freewheel_snapshot_capture'),
+                archive=experiment('restore_archive'),pose=experiment('native_pose'),gate=experiment('freewheel_observer_binding')}
+            assert(cfg.restore_datum_capture==nil or type(cfg.restore_datum_capture)=='boolean','Invalid restore datum mode')
+            parts.requireDatum=cfg.restore_datum_capture==true
+            if parts.requireDatum then parts.datumCodec=experiment('freewheel_datum_transport').new(experiment('freewheel_transport'))end
+            return experiment('restore_observer_binding').new(ROOT,cfg.restore_only_job_id,parts)
+        end)
+        if loaded then state.restoreOnly=runner
+        else state.restoreOnlyError=tostring(runner);ac.log('[ACNextGen Restore] initialization rejected: '..state.restoreOnlyError)end
+    end
+    if ok and type(cfg)=='table' and cfg.airborne_zero_capture==true then
+        local loaded,runner=pcall(function()
+            assert(state.physicalEnabled and Bridge.getState().calibrationCaptureOnly==true,'Airborne jig requires bounded output isolation')
+            assert(cfg.snapshot_save_only_capture~=true and cfg.restore_only_capture~=true,'Airborne jig requires exclusive capture')
+            local function experiment(name)return assert(loadfile(ROOT..'/experiments/'..name..'.lua'))()end
+            local parts={session=experiment('airborne_session'),driver=experiment('airborne_driver'),restoreDriver=experiment('restore_driver'),
+                fixture=experiment('freewheel_fixture'),capture=experiment('freewheel_snapshot_capture'),archive=experiment('restore_archive'),
+                pose=experiment('native_pose'),gate=experiment('freewheel_observer_binding'),channel=experiment('freewheel_channel')}
+            parts.codec=experiment('freewheel_datum_transport').new(experiment('freewheel_transport'))
+            local source={}
+            for _,pair in ipairs({{'FreewheelGeometry','freewheel_geometry'},{'FreewheelObserver','freewheel_worker_observer'},
+                {'FreewheelTransport','freewheel_transport'},{'FreewheelDatumTransport','freewheel_datum_transport'},{'FreewheelChannel','freewheel_channel'}})do
+                source[#source+1]='local '..pair[1]..'=(function()\n'..assert(read(ROOT..'/experiments/'..pair[2]..'.lua'))..'\nend)()\n'
+            end
+            source[#source+1]=assert(read(ROOT..'/experiments/airborne_observation_worker.lua'));parts.workerSource=table.concat(source)
+            return experiment('airborne_observer_binding').new(ROOT,cfg.airborne_zero_job_id,parts)
+        end)
+        if loaded then state.airborneJig=runner
+        else state.airborneError=tostring(runner);ac.log('[ACNextGen Airborne] initialization rejected: '..state.airborneError)end
+    end
     ac.onSessionStart(function() if activeSession() then beginSession() end end)
     ac.onRelease(function() M.shutdown() end)
     ac.log('[ACNextGen Native 4.3] Common Worker supervisor loaded; owned enhancement channels sample pending calibration')
@@ -158,6 +230,20 @@ function M.update(dt)
         elseif not ok then state.error=tostring(result) end
     end
     Bridge.update(dt,state.sessionActive,actualRun(),ac.getCarID(0))
+    if state.snapshotSave then
+        local worked,message=pcall(state.snapshotSave.update,state.snapshotSave,dt,state,Bridge.getState())
+        if not worked then
+            state.snapshotSave:shutdown();state.snapshotSave=nil;state.snapshotSaveError=tostring(message)
+        end
+    end
+    if state.restoreOnly then
+        local worked,message=pcall(state.restoreOnly.update,state.restoreOnly,dt,state,Bridge.getState())
+        if not worked then state.restoreOnly:shutdown();state.restoreOnly=nil;state.restoreOnlyError=tostring(message)end
+    end
+    if state.airborneJig then
+        local worked,message=pcall(state.airborneJig.update,state.airborneJig,dt,state,Bridge.getState())
+        if not worked then state.airborneJig:shutdown();state.airborneJig=nil;state.airborneError=tostring(message)end
+    end
     if state.sessionActive and state.launchTimer>=.4 then launch() end
     if state.leaseTimer>=.05 then state.leaseTimer=0;send() end
     if changed then prepare() end
@@ -168,6 +254,8 @@ function M.start()
     Bridge.resume();launch();send();prepare();return true
 end
 function M.stop()
+    if state.airborneJig then state.airborneJig:shutdown();state.airborneJig=nil end
+    if state.restoreOnly then state.restoreOnly:shutdown();state.restoreOnly=nil end
     state.enabled=false;state.sequence=state.sequence+1;Bridge.setEnabled(false)
     local result=send();prepare();return result
 end
